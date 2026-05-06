@@ -541,49 +541,50 @@ class WeChatProvider:
         # shares the Qt51514QWindowIcon class with regular sub-windows.
         existing_hwnds = self._weixin_top_level_hwnds()
 
-        # Stealth strategy: send WM_LBUTTONDOWN/UP to the sub-window using
-        # window-relative client coordinates derived from the button's
-        # BoundingRectangle. Qt routes the synthetic mouse event to the
-        # widget at that point; the user's cursor, focus, z-order and
-        # window position all stay untouched. This works even when the
-        # sub-window is minimized AND off-screen (rcNormalPosition is in
-        # negative coords) because PostMessage doesn't care about screen
-        # geometry.
+        # Qt drops WM_* mouse messages on minimized windows, so a stealth
+        # PostMessage click no-ops while the chat window is iconic. We
+        # un-minimize via SetWindowPlacement (showCmd = SW_SHOWNOACTIVATE)
+        # which un-minimizes WITHOUT activating and KEEPS the original
+        # off-screen rect intact — so the window stays invisible to the
+        # user but is "live" enough to process synthetic input.
         import win32con
         import win32gui as _w32g
         sub_hwnd = self._chat_state[chat]["hwnd"]
 
-        moved_for_fallback = False  # set if we had to fall back to visible click
-        was_iconic = bool(_w32g.IsIconic(sub_hwnd))
-        placement = _w32g.GetWindowPlacement(sub_hwnd)
-        orig_norm_rect = placement[4]
-        orig_w = orig_norm_rect[2] - orig_norm_rect[0]
-        orig_h = orig_norm_rect[3] - orig_norm_rect[1]
-        moved_offscreen = orig_norm_rect[0] < -10000 or orig_norm_rect[1] < -10000
+        orig_placement = _w32g.GetWindowPlacement(sub_hwnd)
+        was_minimized = bool(_w32g.IsIconic(sub_hwnd))
+        placement_changed = False
+        if was_minimized:
+            try:
+                un_min_placement = (
+                    orig_placement[0],
+                    win32con.SW_SHOWNOACTIVATE,
+                    orig_placement[2],
+                    orig_placement[3],
+                    orig_placement[4],
+                )
+                _w32g.SetWindowPlacement(sub_hwnd, un_min_placement)
+                placement_changed = True
+                time.sleep(0.15)
+            except Exception:
+                log.debug("SetWindowPlacement to un-minimize failed", exc_info=True)
 
-        SWP_NOACTIVATE = 0x0010
-        SWP_NOZORDER = 0x0004
-        SWP_FLAGS = SWP_NOACTIVATE | SWP_NOZORDER
+        # Re-resolve the button after placement change (UIA element handles
+        # may need a refresh once the window is active again).
+        file_btn = self._get_send_file_btn(chat) or file_btn
 
         try:
             stealth_ok = self._post_click(sub_hwnd, file_btn)
             log.debug("send_file: stealth post-click ok=%s", stealth_ok)
-            dlg = None
-            if stealth_ok:
-                dlg = self._wait_new_weixin_window(
-                    existing_hwnds, exclude={sub_hwnd}, timeout_s=4.0,
-                )
+            dlg = self._wait_new_weixin_window(
+                existing_hwnds, exclude={sub_hwnd}, timeout_s=6.0,
+            )
 
-            # Visible fallback: only if stealth didn't surface a dialog.
+            # Fallback only if PostMessage didn't surface a dialog: try a
+            # real UIA Click. Window stays off-screen; if Click insists on
+            # screen coordinates the next layer will surface a clear error.
             if dlg is None:
-                log.debug("send_file: stealth produced no dialog; falling back to visible click")
-                if moved_offscreen:
-                    _w32g.SetWindowPos(sub_hwnd, 0, 100, 100, orig_w, orig_h, SWP_FLAGS)
-                if was_iconic or moved_offscreen:
-                    _w32g.ShowWindow(sub_hwnd, win32con.SW_SHOWNOACTIVATE)
-                    time.sleep(0.3)
-                moved_for_fallback = True
-                file_btn = self._get_send_file_btn(chat) or file_btn
+                log.debug("send_file: stealth produced no dialog; trying UIA Click")
                 try:
                     file_btn.Click(simulateMove=False, waitTime=0)
                 except Exception:
@@ -595,7 +596,7 @@ class WeChatProvider:
                     except Exception as exc:
                         raise RuntimeError(f"could not invoke 发送文件 button: {exc}")
                 dlg = self._wait_new_weixin_window(
-                    existing_hwnds, exclude={sub_hwnd}, timeout_s=8.0,
+                    existing_hwnds, exclude={sub_hwnd}, timeout_s=6.0,
                 )
 
             if dlg is None:
@@ -654,23 +655,12 @@ class WeChatProvider:
                 )
             log.debug("send_file(%s, %r) ok via toolbar+%s", chat, abspath, strategy)
         finally:
-            # Only undo our changes — if stealth path worked we never moved
-            # the window, so we don't need to do anything here.
-            if moved_for_fallback:
-                if moved_offscreen:
-                    try:
-                        _w32g.SetWindowPos(
-                            sub_hwnd, 0,
-                            orig_norm_rect[0], orig_norm_rect[1], orig_w, orig_h,
-                            SWP_FLAGS,
-                        )
-                    except Exception:
-                        pass
-                if was_iconic:
-                    try:
-                        _w32g.ShowWindow(sub_hwnd, win32con.SW_SHOWMINNOACTIVE)
-                    except Exception:
-                        pass
+            # Restore the original placement — back to minimized if it was.
+            if placement_changed:
+                try:
+                    _w32g.SetWindowPlacement(sub_hwnd, orig_placement)
+                except Exception:
+                    pass
 
     @staticmethod
     def _post_click(sub_hwnd: int, btn) -> bool:
