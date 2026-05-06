@@ -314,6 +314,12 @@ class WeChatProvider:
         if not items:
             return
 
+        # `seen` holds the (text -> count) snapshot from the *previous* poll —
+        # NOT a monotonic high-water mark. WeChat's chat_message_list is a
+        # virtualised Qt ListView that only exposes the most-recent ~10 rows;
+        # if we accumulated counts across all of history, repeating an old
+        # text (e.g. retrying the same prompt) would be mis-classified as
+        # already-seen because UIA can no longer show all the past instances.
         seen: Counter = self._chat_state[name]["seen_counts"]
         observed: Counter = Counter()
         new_msgs: List[Tuple[str, str, str]] = []   # (text, class_name, runtime_id)
@@ -330,10 +336,9 @@ class WeChatProvider:
             if observed[txt] > seen[txt]:
                 new_msgs.append((txt, cls, ""))
 
-        # Persist updated counts.
-        for txt, cnt in observed.items():
-            if cnt > seen[txt]:
-                seen[txt] = cnt
+        # Replace the snapshot wholesale so counts can decrease as old rows
+        # scroll out of the UIA window.
+        self._chat_state[name]["seen_counts"] = observed
 
         if not new_msgs:
             return
@@ -509,14 +514,481 @@ class WeChatProvider:
         return None
 
     def _do_send_file(self, chat: str, path: str) -> None:
-        # WeChat 4.x: the input edit accepts a full file path via clipboard
-        # paste + Send. UIA "ValuePattern.SetValue" with the path then Send
-        # triggers the attachment flow. Ctrl+V via SendKeys could also work
-        # but would require the window to have focus. Stick with the standard
-        # path: SetValue does not work for file attachments — we need to use
-        # the "发送文件" button. For now this is unimplemented.
-        raise NotImplementedError(
-            "send_file via UIA is not implemented yet. wxauto4's SendFiles "
-            "requires foreground; consider routing files through 文件传输助手 "
-            "manually for now."
+        """Send a file by clicking the toolbar's '发送文件' button to bring
+        up the standard Win32 file-open dialog, then driving that dialog
+        via UIA: write the absolute path into its filename field, click
+        '打开', and let WeChat attach the file the same way it does for a
+        human user. This is the most reliable path because it is exactly
+        the one a person would take.
+
+        Trade-off: while the file dialog is open it has keyboard focus
+        (Win32 file dialogs are always foreground). When the dialog
+        closes, focus returns to whatever was active before."""
+        if chat not in self._chat_state:
+            raise RuntimeError(f"chat not in LISTEN_CHATS: {chat!r}")
+        p = Path(path)
+        if not p.exists() or not p.is_file():
+            raise FileNotFoundError(p)
+        abspath = str(p.resolve())
+
+        file_btn = self._get_send_file_btn(chat)
+        if file_btn is None:
+            raise RuntimeError(f"toolbar '发送文件' button not found in {chat!r}")
+
+        # Snapshot existing top-level Weixin windows so we can detect the new
+        # one that the file dialog opens. ClassName-based detection (#32770)
+        # is too narrow: WeChat 4.x sometimes pops a Qt-skinned dialog that
+        # shares the Qt51514QWindowIcon class with regular sub-windows.
+        existing_hwnds = self._weixin_top_level_hwnds()
+
+        # Stealth strategy: send WM_LBUTTONDOWN/UP to the sub-window using
+        # window-relative client coordinates derived from the button's
+        # BoundingRectangle. Qt routes the synthetic mouse event to the
+        # widget at that point; the user's cursor, focus, z-order and
+        # window position all stay untouched. This works even when the
+        # sub-window is minimized AND off-screen (rcNormalPosition is in
+        # negative coords) because PostMessage doesn't care about screen
+        # geometry.
+        import win32con
+        import win32gui as _w32g
+        sub_hwnd = self._chat_state[chat]["hwnd"]
+
+        moved_for_fallback = False  # set if we had to fall back to visible click
+        was_iconic = bool(_w32g.IsIconic(sub_hwnd))
+        placement = _w32g.GetWindowPlacement(sub_hwnd)
+        orig_norm_rect = placement[4]
+        orig_w = orig_norm_rect[2] - orig_norm_rect[0]
+        orig_h = orig_norm_rect[3] - orig_norm_rect[1]
+        moved_offscreen = orig_norm_rect[0] < -10000 or orig_norm_rect[1] < -10000
+
+        SWP_NOACTIVATE = 0x0010
+        SWP_NOZORDER = 0x0004
+        SWP_FLAGS = SWP_NOACTIVATE | SWP_NOZORDER
+
+        try:
+            stealth_ok = self._post_click(sub_hwnd, file_btn)
+            log.debug("send_file: stealth post-click ok=%s", stealth_ok)
+            dlg = None
+            if stealth_ok:
+                dlg = self._wait_new_weixin_window(
+                    existing_hwnds, exclude={sub_hwnd}, timeout_s=4.0,
+                )
+
+            # Visible fallback: only if stealth didn't surface a dialog.
+            if dlg is None:
+                log.debug("send_file: stealth produced no dialog; falling back to visible click")
+                if moved_offscreen:
+                    _w32g.SetWindowPos(sub_hwnd, 0, 100, 100, orig_w, orig_h, SWP_FLAGS)
+                if was_iconic or moved_offscreen:
+                    _w32g.ShowWindow(sub_hwnd, win32con.SW_SHOWNOACTIVATE)
+                    time.sleep(0.3)
+                moved_for_fallback = True
+                file_btn = self._get_send_file_btn(chat) or file_btn
+                try:
+                    file_btn.Click(simulateMove=False, waitTime=0)
+                except Exception:
+                    log.debug("file_btn.Click raised; trying InvokePattern", exc_info=True)
+                    try:
+                        ip = file_btn.GetInvokePattern()
+                        if ip is not None:
+                            ip.Invoke()
+                    except Exception as exc:
+                        raise RuntimeError(f"could not invoke 发送文件 button: {exc}")
+                dlg = self._wait_new_weixin_window(
+                    existing_hwnds, exclude={sub_hwnd}, timeout_s=8.0,
+                )
+
+            if dlg is None:
+                snapshot = self._weixin_top_level_hwnds()
+                added = snapshot - existing_hwnds - {sub_hwnd}
+                log.debug(
+                    "send_file: no new window; existing=%d snapshot=%d added=%s",
+                    len(existing_hwnds), len(snapshot), [hex(h) for h in added],
+                )
+                raise RuntimeError(
+                    "file dialog did not appear after clicking 发送文件 (both stealth and visible)"
+                )
+
+            log.debug("send_file: detected new window hwnd=%s class=%r title=%r",
+                      hex(getattr(dlg, "NativeWindowHandle", 0) or 0),
+                      _w32g.GetClassName(dlg.NativeWindowHandle) if dlg.NativeWindowHandle else "",
+                      _w32g.GetWindowText(dlg.NativeWindowHandle) if dlg.NativeWindowHandle else "")
+
+            try:
+                self._fill_file_dialog(dlg, abspath)
+                self._wait_dialog_closed(dlg, timeout_s=6.0)
+            except Exception:
+                self._dismiss_file_dialog(dlg)
+                raise
+
+            # Composition area now has the attachment chip; brief settle delay
+            # before firing send so the button's IsEnabled state stabilises.
+            time.sleep(0.4)
+
+            edit = self._get_input(chat)
+            btn = self._get_send_btn(chat)
+            if edit is None or btn is None:
+                raise RuntimeError("send button or input vanished after dialog closed")
+
+            def btn_enabled() -> Optional[bool]:
+                try:
+                    return bool(btn.IsEnabled)
+                except Exception:
+                    return None
+
+            strategy = self._fire_send_attached(sub_hwnd, edit, btn, btn_enabled)
+            if not strategy:
+                # Last resort: blind invoke. Dialog closed cleanly so the
+                # composition area has the attachment regardless of whether
+                # IsEnabled is a reliable signal on this build.
+                try:
+                    ip = btn.GetInvokePattern()
+                    if ip is not None:
+                        ip.Invoke()
+                        strategy = "invoke_blind"
+                except Exception:
+                    pass
+            if not strategy:
+                raise RuntimeError(
+                    f"send_file({chat!r}, {path!r}): attached via toolbar but send failed"
+                )
+            log.debug("send_file(%s, %r) ok via toolbar+%s", chat, abspath, strategy)
+        finally:
+            # Only undo our changes — if stealth path worked we never moved
+            # the window, so we don't need to do anything here.
+            if moved_for_fallback:
+                if moved_offscreen:
+                    try:
+                        _w32g.SetWindowPos(
+                            sub_hwnd, 0,
+                            orig_norm_rect[0], orig_norm_rect[1], orig_w, orig_h,
+                            SWP_FLAGS,
+                        )
+                    except Exception:
+                        pass
+                if was_iconic:
+                    try:
+                        _w32g.ShowWindow(sub_hwnd, win32con.SW_SHOWMINNOACTIVE)
+                    except Exception:
+                        pass
+
+    @staticmethod
+    def _post_click(sub_hwnd: int, btn) -> bool:
+        """Send a synthetic mouse click to a UIA Button via PostMessage,
+        using the sub-window's client-relative coordinates derived from
+        the button's BoundingRectangle. Doesn't touch cursor / focus /
+        z-order, so it's invisible to the user. Returns True on success."""
+        import ctypes
+        import win32api
+        import win32con
+        import win32gui
+
+        try:
+            rect = btn.BoundingRectangle
+        except Exception:
+            return False
+        if rect is None:
+            return False
+        # uiautomation Rect has .left/.top/.right/.bottom attrs.
+        try:
+            cx = (rect.left + rect.right) // 2
+            cy = (rect.top + rect.bottom) // 2
+        except Exception:
+            return False
+        try:
+            client_x, client_y = win32gui.ScreenToClient(sub_hwnd, (cx, cy))
+        except Exception:
+            return False
+        lparam = ((client_y & 0xFFFF) << 16) | (client_x & 0xFFFF)
+        MK_LBUTTON = 0x0001
+        try:
+            win32api.PostMessage(sub_hwnd, win32con.WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+            win32api.PostMessage(sub_hwnd, win32con.WM_LBUTTONUP, 0, lparam)
+            return True
+        except Exception:
+            return False
+
+    def _fire_send_attached(self, hwnd: int, edit, btn,
+                            btn_enabled: Callable[[], Optional[bool]]) -> Optional[str]:
+        """Send when something is attached. Success = button flips back
+        from enabled to disabled (composition area emptied)."""
+        import win32con
+        import win32gui
+
+        def cleared() -> bool:
+            return btn_enabled() is False
+
+        try:
+            ip = btn.GetInvokePattern()
+            if ip is not None:
+                ip.Invoke()
+                time.sleep(0.4)
+                if cleared():
+                    return "invoke"
+        except Exception:
+            log.debug("invoke strategy raised", exc_info=True)
+
+        try:
+            try:
+                edit.SetFocus()
+            except Exception:
+                pass
+            win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
+            win32gui.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
+            time.sleep(0.4)
+            if cleared():
+                return "post_enter"
+        except Exception:
+            log.debug("post_enter strategy raised", exc_info=True)
+
+        try:
+            was_iconic = bool(win32gui.IsIconic(hwnd))
+            if was_iconic:
+                win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
+                time.sleep(0.12)
+            btn.Click(simulateMove=False, waitTime=0)
+            time.sleep(0.4)
+            sent = cleared()
+            if was_iconic:
+                win32gui.ShowWindow(hwnd, win32con.SW_SHOWMINNOACTIVE)
+            if sent:
+                return "restore_click" if was_iconic else "click"
+        except Exception:
+            log.debug("restore_click strategy raised", exc_info=True)
+
+        return None
+
+    def _get_send_file_btn(self, chat: str):
+        """Locate the '发送文件' button in the chat sub-window's toolbar."""
+        root = self._get_root(chat)
+        toolbar = self._find_by_aid(root, "tool_bar_accessible")
+        if toolbar is None:
+            return None
+        return self._find_by(
+            toolbar,
+            lambda c: c.ControlTypeName == "ButtonControl" and c.Name == "发送文件",
         )
+
+    def _weixin_top_level_hwnds(self) -> set:
+        """Set of every top-level window hwnd owned by a Weixin process."""
+        import win32gui
+        import win32process
+
+        weixin_pids = self._find_weixin_pids()
+        out: set = set()
+
+        def cb(h, _):
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(h)
+                if pid in weixin_pids and win32gui.IsWindowVisible(h):
+                    out.add(h)
+            except Exception:
+                pass
+
+        win32gui.EnumWindows(cb, None)
+        return out
+
+    def _wait_new_weixin_window(self, existing: set, exclude: set,
+                                 timeout_s: float = 12.0):
+        """Poll for a newly-visible Weixin window that contains an Edit
+        control — that's our signal it's the file-open dialog. As soon as
+        ANY new top-level Weixin window appears we move it off-screen via
+        SetWindowPos (no activate, no z-order change), so the user never
+        sees the dialog flash on screen. The dialog continues to function
+        normally at coordinates (-30000, -30000) — UIA + PostMessage
+        operations don't depend on window position."""
+        import ctypes
+        import uiautomation as auto
+        import win32gui
+
+        SWP_NOACTIVATE = 0x0010
+        SWP_NOZORDER = 0x0004
+        SWP_NOSIZE = 0x0001
+        SWP_FLAGS = SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE
+        SetWindowPos = ctypes.windll.user32.SetWindowPos
+
+        examined: set = set()
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            now = self._weixin_top_level_hwnds()
+            candidates = sorted((now - existing) - exclude, reverse=True)
+            for hwnd in candidates:
+                if hwnd in examined:
+                    continue
+                examined.add(hwnd)
+                # Hide ASAP — including SoPY_Status splash and any other
+                # transient window so the user perceives no flicker.
+                try:
+                    SetWindowPos(hwnd, 0, -30000, -30000, 0, 0, SWP_FLAGS)
+                except Exception:
+                    pass
+                try:
+                    cls = win32gui.GetClassName(hwnd)
+                    title = win32gui.GetWindowText(hwnd)
+                except Exception:
+                    cls, title = "", ""
+                if cls in ("SoPY_Status", "IME", "tooltips_class32",
+                            "Internet Explorer_Hidden", "OleMainThreadWndClass"):
+                    log.debug("send_file: hid non-dialog window cls=%r", cls)
+                    continue
+                ctrl = auto.ControlFromHandle(hwnd)
+                if ctrl is None:
+                    continue
+                if self._has_edit_control(ctrl):
+                    log.debug("send_file: matched dialog hwnd=%s cls=%r title=%r",
+                              hex(hwnd), cls, title[:40])
+                    return ctrl
+                else:
+                    log.debug("send_file: window has no Edit, hidden cls=%r title=%r",
+                              cls, title[:40])
+            time.sleep(0.03)
+        return None
+
+    @staticmethod
+    def _has_edit_control(node, depth: int = 0, max_depth: int = 10) -> bool:
+        if node is None or depth > max_depth:
+            return False
+        try:
+            if node.ControlTypeName == "EditControl":
+                return True
+            for k in node.GetChildren():
+                if WeChatProvider._has_edit_control(k, depth + 1, max_depth):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _fill_file_dialog(self, dlg, abspath: str) -> None:
+        """Write *abspath* into the dialog's filename field and click 打开."""
+        import uiautomation as auto
+
+        # Collect every Edit + Button in the dialog for diagnosis and to
+        # pick the right one(s) by name rather than position.
+        edits: List[Any] = []
+        buttons: List[Any] = []
+
+        def visit(node, depth: int = 0):
+            if depth > 10 or node is None:
+                return
+            try:
+                ctl = node.ControlTypeName
+                if ctl == "EditControl":
+                    edits.append(node)
+                elif ctl == "ButtonControl":
+                    buttons.append(node)
+                for k in node.GetChildren():
+                    visit(k, depth + 1)
+            except Exception:
+                pass
+
+        visit(dlg)
+        log.debug("send_file: dialog has %d edits, %d buttons", len(edits), len(buttons))
+        for i, e in enumerate(edits):
+            log.debug("  edit[%d]: name=%r aid=%r",
+                      i, (e.Name or "")[:50], (e.AutomationId or "")[:30])
+        for i, b in enumerate(buttons):
+            log.debug("  button[%d]: name=%r aid=%r",
+                      i, (b.Name or "")[:50], (b.AutomationId or "")[:30])
+
+        if not edits:
+            raise RuntimeError("file dialog has no Edit controls")
+
+        # Prefer the edit whose name mentions "文件名" / "File name"; else last.
+        fname_edit = None
+        for e in edits:
+            nm = e.Name or ""
+            if "文件名" in nm or "File name" in nm or "file name" in nm.lower():
+                fname_edit = e
+                break
+        if fname_edit is None:
+            fname_edit = edits[-1]
+
+        # Try ValuePattern first; verify; fall back to SendKeys.
+        try:
+            fname_edit.GetValuePattern().SetValue(abspath)
+        except Exception as exc:
+            log.debug("send_file: SetValue raised: %s", exc)
+        time.sleep(0.2)
+        try:
+            actual = fname_edit.GetValuePattern().Value or ""
+        except Exception:
+            actual = ""
+        log.debug("send_file: filename edit value after SetValue: %r", actual[:120])
+
+        if actual != abspath:
+            try:
+                fname_edit.SetFocus()
+                time.sleep(0.1)
+                # Select-all + delete first so we don't append.
+                auto.SendKeys("{Ctrl}a{Delete}", waitTime=0.05)
+                # Send the path. {} bracket parsing in uiautomation.SendKeys
+                # treats backslashes literally; colon and slash are fine.
+                auto.SendKeys(abspath, waitTime=0.02)
+                time.sleep(0.25)
+                actual = ""
+                try:
+                    actual = fname_edit.GetValuePattern().Value or ""
+                except Exception:
+                    pass
+                log.debug("send_file: filename edit after SendKeys: %r", actual[:120])
+            except Exception as exc:
+                log.debug("send_file: SendKeys fallback raised: %s", exc)
+
+        # The Win32 file dialog's Open button is a Split-button. UIA exposes
+        # only the dropdown halves (aid='DropDown'), not a clean IDOK
+        # ButtonControl, so clicking what UIA calls 'Open' just opens the
+        # dropdown menu — the dialog never submits. The reliable approach
+        # is the Win32 protocol: PostMessage(WM_COMMAND, IDOK) to the dialog
+        # hwnd; the OK handler reads the filename edit and dismisses.
+        import ctypes
+        WM_COMMAND = 0x0111
+        IDOK = 1
+        dlg_hwnd = getattr(dlg, "NativeWindowHandle", 0) or 0
+        if not dlg_hwnd:
+            raise RuntimeError("dialog has no NativeWindowHandle for IDOK")
+
+        log.debug("send_file: posting WM_COMMAND IDOK to dialog hwnd=%s", hex(dlg_hwnd))
+        ok = ctypes.windll.user32.PostMessageW(dlg_hwnd, WM_COMMAND, IDOK, 0)
+        if not ok:
+            log.debug("send_file: PostMessage WM_COMMAND failed; trying Click fallback")
+            # Fallback: click any button named 打开/Open (may open dropdown).
+            for b in buttons:
+                nm = (b.Name or "").strip()
+                if nm in ("打开(O)", "打开", "Open", "Open(O)") or "打开" in nm:
+                    try:
+                        b.Click(simulateMove=False, waitTime=0)
+                        return
+                    except Exception:
+                        pass
+            raise RuntimeError("could not submit file dialog (IDOK)")
+
+    @staticmethod
+    def _wait_dialog_closed(dlg, timeout_s: float = 6.0) -> None:
+        import win32gui
+        hwnd = getattr(dlg, "NativeWindowHandle", 0) or 0
+        if not hwnd:
+            return
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if not win32gui.IsWindow(hwnd):
+                return
+            time.sleep(0.15)
+        raise RuntimeError("file dialog did not close after Open")
+
+    def _dismiss_file_dialog(self, dlg) -> None:
+        """Best-effort: click Cancel/取消 to close a stuck dialog so the
+        chat doesn't end up with a dangling modal blocking the input."""
+        cancel = self._find_by(
+            dlg,
+            lambda c: c.ControlTypeName == "ButtonControl" and (
+                "取消" in (c.Name or "") or "Cancel" in (c.Name or "")
+            ),
+        )
+        if cancel is None:
+            return
+        try:
+            ip = cancel.GetInvokePattern()
+            if ip is not None:
+                ip.Invoke()
+        except Exception:
+            pass
