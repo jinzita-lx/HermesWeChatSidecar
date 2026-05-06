@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+data/downloads/
+data/inbound/
+data/seen_ids.json
+logs/
