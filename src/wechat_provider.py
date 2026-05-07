@@ -169,21 +169,86 @@ class WeChatProvider:
 
     def _init(self) -> None:
         import uiautomation as auto  # noqa: F401  (just to fail-fast on missing dep)
+        import win32con
+        import win32gui
 
         weixin_pids = self._find_weixin_pids()
         if not weixin_pids:
             raise RuntimeError("no running Weixin.exe — start WeChat first")
         log.info("Weixin pids=%s", sorted(weixin_pids))
 
+        # If 微信 main window is minimized, un-minimize it off-screen so the
+        # popout right-clicks can target it via UIA. We restore the original
+        # placement after everything is set up. The whole un-minimize +
+        # popout dance is invisible to the user (window stays at -30000)
+        # and never steals focus.
+        main_hwnd = self._find_main_weixin_window_any_state(weixin_pids)
+        main_restore_placement = None
+        if main_hwnd is not None and win32gui.IsIconic(main_hwnd):
+            try:
+                orig_pl = win32gui.GetWindowPlacement(main_hwnd)
+                onr = orig_pl[4]  # rcNormalPosition
+                w = max(800, onr[2] - onr[0])
+                h = max(600, onr[3] - onr[1])
+                offscreen_pl = (
+                    orig_pl[0],
+                    win32con.SW_SHOWNOACTIVATE,
+                    orig_pl[2],
+                    orig_pl[3],
+                    (-30000, -30000, -30000 + w, -30000 + h),
+                )
+                win32gui.SetWindowPlacement(main_hwnd, offscreen_pl)
+                main_restore_placement = orig_pl
+                log.info("main 微信 was minimized; temporarily un-minimized off-screen for popout")
+                time.sleep(0.4)
+            except Exception:
+                log.debug("could not un-minimize main window off-screen", exc_info=True)
+
+        import uiautomation as auto
+        try:
+            self._init_chats(weixin_pids)
+        finally:
+            if main_restore_placement is not None:
+                try:
+                    win32gui.SetWindowPlacement(main_hwnd, main_restore_placement)
+                    log.info("main 微信 restored to original placement (minimized)")
+                except Exception:
+                    log.debug("could not restore main window placement", exc_info=True)
+
+    def _init_chats(self, weixin_pids: set) -> None:
         import uiautomation as auto
         for chat in self._listen_chats:
             hwnd = self._find_chat_subwindow(chat, weixin_pids)
             if not hwnd:
-                raise RuntimeError(
-                    f"could not find independent sub-window for {chat!r}. "
-                    f"Right-click the chat in PC WeChat -> '在独立窗口中打开', "
-                    f"then restart sidecar."
-                )
+                log.info("no independent sub-window for %r; popping out via main window UIA", chat)
+                try:
+                    self._popout_chat(chat, weixin_pids)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"could not auto-pop-out {chat!r}: {exc}. Make sure 微信主窗口 is "
+                        f"visible (not minimized) and the chat is in the session list, "
+                        f"or right-click → '独立窗口显示' manually and restart."
+                    )
+                # Wait up to 5s for the new sub-window to appear.
+                for _ in range(25):
+                    hwnd = self._find_chat_subwindow(chat, weixin_pids)
+                    if hwnd:
+                        break
+                    time.sleep(0.2)
+                if not hwnd:
+                    raise RuntimeError(
+                        f"popped out {chat!r} but new sub-window did not appear within 5s"
+                    )
+                # Immediately minimize the freshly popped window so it
+                # doesn't cover the main window's session_list for the
+                # next chat's RightClick.
+                try:
+                    import win32con as _wc
+                    import win32gui as _wg
+                    _wg.ShowWindow(hwnd, _wc.SW_SHOWMINNOACTIVE)
+                    time.sleep(0.4)
+                except Exception:
+                    log.debug("could not minimize freshly popped sub-window", exc_info=True)
             root = auto.ControlFromHandle(hwnd)
             aid = (root.AutomationId or "") if root else ""
             chat_type = "group" if "@chatroom" in aid else "private"
@@ -228,6 +293,312 @@ class WeChatProvider:
                 pass
         win32gui.EnumWindows(cb, None)
         return match[0] if match else None
+
+    @staticmethod
+    def _find_main_weixin_window(weixin_pids: set) -> Optional[int]:
+        """Find the main 微信 window (the one with the chat list, NOT a
+        popped-out single-chat window). Must be visible and not iconic."""
+        import win32gui
+        import win32process
+
+        match: List[int] = []
+        def cb(h, _):
+            try:
+                if win32gui.GetClassName(h) != WEIXIN_WINDOW_CLASS:
+                    return
+                _, pid = win32process.GetWindowThreadProcessId(h)
+                if pid not in weixin_pids:
+                    return
+                if win32gui.GetWindowText(h) != "微信":
+                    return
+                if win32gui.IsIconic(h):
+                    return
+                match.append(h)
+            except Exception:
+                pass
+        win32gui.EnumWindows(cb, None)
+        return match[0] if match else None
+
+    @staticmethod
+    def _find_main_weixin_window_any_state(weixin_pids: set) -> Optional[int]:
+        """Same as _find_main_weixin_window but also matches a minimized
+        (iconic) main window. Used at startup so we can detect a minimized
+        main window and un-minimize it off-screen before popping out chats."""
+        import win32gui
+        import win32process
+
+        match: List[int] = []
+        def cb(h, _):
+            try:
+                if win32gui.GetClassName(h) != WEIXIN_WINDOW_CLASS:
+                    return
+                _, pid = win32process.GetWindowThreadProcessId(h)
+                if pid not in weixin_pids:
+                    return
+                if win32gui.GetWindowText(h) != "微信":
+                    return
+                match.append(h)
+            except Exception:
+                pass
+        win32gui.EnumWindows(cb, None)
+        return match[0] if match else None
+
+    def _popout_chat(self, chat_name: str, weixin_pids: set) -> None:
+        """Use main-window UIA to right-click the chat in the session list
+        and select '独立窗口显示' from the context menu, so we don't require
+        the user to set this up by hand."""
+        import uiautomation as auto
+        import win32api
+        import win32con
+        import win32gui
+        import win32process
+
+        main_hwnd = self._find_main_weixin_window(weixin_pids)
+        if main_hwnd is None:
+            raise RuntimeError(
+                "微信主窗口 not found or minimized — un-minimize it once so "
+                "sidecar can pop out its listened chats"
+            )
+
+        root = auto.ControlFromHandle(main_hwnd)
+        item_aid = f"session_item_{chat_name}"
+        item = self._find_by_aid(root, item_aid, depth=20)
+        if item is None:
+            # The session list is virtualized; chat may be off-screen. Try
+            # the search box as a fallback to bring the chat into view.
+            self._search_chat_in_main(root, chat_name)
+            time.sleep(0.4)
+            item = self._find_by_aid(root, item_aid, depth=20)
+            if item is None:
+                raise RuntimeError(
+                    f"chat {chat_name!r} not found in session_list; scroll "
+                    "it into view in 微信主窗口 and retry"
+                )
+
+        log.info("popout(%s): right-clicking session item", chat_name)
+        before = self._weixin_top_level_hwnds()
+        menu_root = None
+        saved_fore = win32gui.GetForegroundWindow()
+        used_foreground = False
+
+        # Stealth first: PostMessage WM_RBUTTONDOWN/UP + WM_CONTEXTMENU to
+        # the main window's client coords. Doesn't move cursor, doesn't
+        # change z-order, doesn't steal focus. Qt's session list responds
+        # to this even when not foreground.
+        for attempt in range(2):
+            ok = self._post_right_click(main_hwnd, item)
+            log.debug("popout: stealth right-click attempt %d ok=%s", attempt + 1, ok)
+            if not ok:
+                break
+            menu_root = self._wait_context_menu(weixin_pids, before, timeout_s=1.5)
+            if menu_root is not None:
+                break
+            time.sleep(0.2)
+
+        # Fallback: only if stealth failed do we briefly take foreground.
+        if menu_root is None:
+            log.debug("popout(%s): stealth failed, falling back to foreground+RightClick", chat_name)
+            try:
+                self._bring_to_foreground(main_hwnd)
+                used_foreground = True
+                time.sleep(0.2)
+            except Exception:
+                log.debug("bring_to_foreground failed", exc_info=True)
+            for attempt in range(3):
+                try:
+                    item.RightClick(simulateMove=False, waitTime=0)
+                except Exception as exc:
+                    log.debug("RightClick attempt %d raised: %s", attempt + 1, exc)
+                    time.sleep(0.3)
+                    continue
+                menu_root = self._wait_context_menu(weixin_pids, before, timeout_s=2.5)
+                if menu_root is not None:
+                    break
+                time.sleep(0.3)
+
+        if menu_root is None:
+            try:
+                if used_foreground and saved_fore and saved_fore != main_hwnd:
+                    self._bring_to_foreground(saved_fore)
+            except Exception:
+                pass
+            raise RuntimeError("context menu did not appear after right-click")
+        log.info("popout(%s): context menu detected", chat_name)
+
+        # Dump menu items for diagnosis (helps spot wording differences).
+        menu_items: List[Any] = []
+        def collect(n, d=0):
+            if d > 6 or n is None: return
+            try:
+                if n.ControlTypeName == "MenuItemControl":
+                    menu_items.append(n)
+                for k in n.GetChildren():
+                    collect(k, d+1)
+            except Exception: pass
+        collect(menu_root)
+        for mi in menu_items:
+            log.debug("popout: menu item %r", (mi.Name or "")[:40])
+
+        popout = None
+        for mi in menu_items:
+            nm = (mi.Name or "").strip()
+            if nm in ("独立窗口显示", "在独立窗口中打开", "Open in separate window"):
+                popout = mi
+                break
+        if popout is None:
+            try:
+                mh = menu_root.NativeWindowHandle
+                win32api.PostMessage(mh, win32con.WM_KEYDOWN, win32con.VK_ESCAPE, 0)
+                win32api.PostMessage(mh, win32con.WM_KEYUP, win32con.VK_ESCAPE, 0)
+            except Exception:
+                pass
+            names = [(mi.Name or "")[:30] for mi in menu_items]
+            raise RuntimeError(f"'独立窗口显示' not in menu items: {names}")
+
+        log.info("popout(%s): clicking '%s'", chat_name, (popout.Name or ""))
+        menu_hwnd = getattr(menu_root, "NativeWindowHandle", 0) or 0
+        clicked = False
+        # Stealth first: PostMessage WM_LBUTTONDOWN/UP to menu window client
+        # coords — invisible to the user.
+        if menu_hwnd:
+            clicked = self._post_click(menu_hwnd, popout)
+            log.debug("popout: stealth menu click ok=%s", clicked)
+            time.sleep(0.2)
+        if not clicked:
+            # Fallback: real Click then Invoke
+            try:
+                popout.Click(simulateMove=False, waitTime=0)
+                clicked = True
+            except Exception:
+                log.debug("popout Click raised; trying Invoke", exc_info=True)
+            if not clicked:
+                try:
+                    ip = popout.GetInvokePattern()
+                    if ip is not None:
+                        ip.Invoke()
+                        clicked = True
+                except Exception as exc:
+                    raise RuntimeError(f"could not invoke 独立窗口显示: {exc}")
+        if not clicked:
+            raise RuntimeError("could not click 独立窗口显示")
+
+        # Restore original foreground only if we touched it.
+        try:
+            if used_foreground and saved_fore and saved_fore != main_hwnd:
+                self._bring_to_foreground(saved_fore)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _post_right_click(target_hwnd: int, ctrl) -> bool:
+        """Synthetic right-click via PostMessage to the target's client
+        coords. Sends WM_RBUTTONDOWN, WM_RBUTTONUP, then WM_CONTEXTMENU
+        (Qt typically posts the context menu in response to the latter).
+        Returns True if all messages posted; doesn't verify the menu
+        actually opens — caller should poll for it."""
+        import ctypes
+        import win32api
+        import win32con
+        import win32gui
+
+        try:
+            rect = ctrl.BoundingRectangle
+        except Exception:
+            return False
+        if rect is None:
+            return False
+        try:
+            cx = (rect.left + rect.right) // 2
+            cy = (rect.top + rect.bottom) // 2
+        except Exception:
+            return False
+        try:
+            client_x, client_y = win32gui.ScreenToClient(target_hwnd, (cx, cy))
+        except Exception:
+            return False
+        lparam_client = ((client_y & 0xFFFF) << 16) | (client_x & 0xFFFF)
+        lparam_screen = ((cy & 0xFFFF) << 16) | (cx & 0xFFFF)
+        MK_RBUTTON = 0x0002
+        WM_CONTEXTMENU = 0x007B
+        try:
+            win32api.PostMessage(target_hwnd, win32con.WM_RBUTTONDOWN, MK_RBUTTON, lparam_client)
+            win32api.PostMessage(target_hwnd, win32con.WM_RBUTTONUP, 0, lparam_client)
+            win32api.PostMessage(target_hwnd, WM_CONTEXTMENU, target_hwnd, lparam_screen)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _bring_to_foreground(hwnd: int) -> None:
+        """Best-effort: bring hwnd to foreground using AttachThreadInput
+        trick to bypass the foreground-lock timeout."""
+        import ctypes
+        import win32process
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        fore_hwnd = user32.GetForegroundWindow()
+        if fore_hwnd == hwnd:
+            return
+        cur = kernel32.GetCurrentThreadId()
+        fore_thr = (
+            win32process.GetWindowThreadProcessId(fore_hwnd)[0] if fore_hwnd else 0
+        )
+        target_thr = win32process.GetWindowThreadProcessId(hwnd)[0]
+        attached_fore = False
+        attached_target = False
+        if fore_thr and fore_thr != cur:
+            user32.AttachThreadInput(cur, fore_thr, True)
+            attached_fore = True
+        if target_thr and target_thr != cur:
+            user32.AttachThreadInput(cur, target_thr, True)
+            attached_target = True
+        try:
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            if attached_target:
+                user32.AttachThreadInput(cur, target_thr, False)
+            if attached_fore:
+                user32.AttachThreadInput(cur, fore_thr, False)
+
+    def _search_chat_in_main(self, main_root, chat_name: str) -> None:
+        """Type the chat name into 微信主窗口's search box so the chat shows
+        up in the session list. Best-effort; we don't fail if the search
+        box can't be located — caller will check session list afterwards."""
+        search_edit = self._find_by(
+            main_root,
+            lambda c: c.ControlTypeName == "EditControl"
+            and (c.Name or "") == "搜索",
+            depth=20,
+        )
+        if search_edit is None:
+            return
+        try:
+            search_edit.GetValuePattern().SetValue(chat_name)
+        except Exception:
+            pass
+
+    def _wait_context_menu(self, weixin_pids: set, existing: set,
+                            timeout_s: float = 3.0):
+        """Wait for the Qt context-menu top-level window (class
+        Qt51514QWindowToolSaveBits) to appear and contain MenuItem children."""
+        import uiautomation as auto
+        import win32gui
+        import win32process
+
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            now = self._weixin_top_level_hwnds()
+            for hwnd in now - existing:
+                try:
+                    cls = win32gui.GetClassName(hwnd)
+                except Exception:
+                    cls = ""
+                if cls == "Qt51514QWindowToolSaveBits":
+                    return auto.ControlFromHandle(hwnd)
+            time.sleep(0.08)
+        return None
 
     def _snapshot_existing(self, name: str) -> None:
         ml = self._get_msg_list(name)
