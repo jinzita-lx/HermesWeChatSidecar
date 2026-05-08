@@ -11,9 +11,9 @@ _BUCKET_MINUTES = 10
 
 
 class BucketedFileHandler(logging.Handler):
-    """Writes records into ``<root>/YYYY-MM-DD/HHMM.log``, where HHMM is the
-    start of the current 10-minute bucket (e.g. 0000, 0010, 0020 ...). The
-    handler reopens a new file on every bucket boundary.
+    """Writes records into ``<root>/YYYY-MM-DD/HH/HHMM.log``, where HHMM is
+    the start of the current 10-minute bucket (e.g. 0000, 0010, 0020 ...).
+    The handler reopens a new file on every bucket boundary.
     """
 
     def __init__(self, root_dir: Path, bucket_minutes: int = _BUCKET_MINUTES,
@@ -27,7 +27,8 @@ class BucketedFileHandler(logging.Handler):
 
     def _path_for(self, dt: datetime) -> Path:
         m = (dt.minute // self._bucket) * self._bucket
-        return self._root / dt.strftime("%Y-%m-%d") / f"{dt.hour:02d}{m:02d}.log"
+        hour = f"{dt.hour:02d}"
+        return self._root / dt.strftime("%Y-%m-%d") / hour / f"{hour}{m:02d}.log"
 
     def _open(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
