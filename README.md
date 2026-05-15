@@ -46,6 +46,50 @@ pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m src.main
 ```
 
+## 管理命令 `hs`
+
+`scripts/hs.ps1` 提供 sidecar 的后台管理命令（启动/停止/状态/日志）。注册成 `hs`
+后，在 PowerShell 和 WSL 里都能调用，且操作的是**同一个** Windows 进程。
+
+```
+hs status                     # 运行状态 + PID + uptime + 最近日志
+hs start                      # 后台启动（无窗口）
+hs stop                       # 停止所有 sidecar 进程
+hs restart                    # 重启
+hs logs [-Tail N] [-Follow]   # 查看最近日志，-Follow 实时跟踪
+hs help                       # 帮助
+```
+
+> 注：`hs` 命令不随仓库自动生效，需按下面方式在各环境注册一次。
+
+### 在 PowerShell / cmd 注册
+
+把 `scripts` 目录加入用户 PATH（一次性，新开终端生效）：
+
+```powershell
+$dir = "C:\HermesWeChatSidecar\scripts"
+$p = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($p -notlike "*$dir*") {
+    [Environment]::SetEnvironmentVariable("Path", "$p;$dir", "User")
+}
+```
+
+之后任意 PowerShell / cmd 窗口都能直接用 `hs`（由 `scripts\hs.cmd` 包装器分发到 `hs.ps1`）。
+
+### 在 WSL 注册
+
+往 shell rc（`~/.zshrc` 或 `~/.bashrc`）追加一个函数，委托调用 Windows 侧脚本：
+
+```bash
+hs() {
+  /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe \
+    -NoProfile -ExecutionPolicy Bypass \
+    -File 'C:\HermesWeChatSidecar\scripts\hs.ps1' "$@"
+}
+```
+
+`exec zsh`（或新开终端）后生效。
+
 ## 测试
 
 1. 启动 sidecar，看日志连上 WS。
@@ -61,3 +105,5 @@ pip install -r requirements.txt
 - `src/command_executor.py` 处理 send_text / send_file / send_image
 - `src/main.py` 入口
 - `run.ps1` 启动脚本
+- `scripts/hs.ps1` + `scripts/hs.cmd` 管理命令（start/stop/restart/status/logs）
+- `scripts/tunnel-watchdog.ps1` SSH 隧道守护，断线自动重连

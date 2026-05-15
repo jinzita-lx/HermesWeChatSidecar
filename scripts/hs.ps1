@@ -26,7 +26,7 @@ function Get-LatestLogFile {
 
 function Show-Help {
     @'
-Usage: hermes-sidecar <command> [options]
+Usage: hs <command> [options]
 
 Commands:
   start                       Start the sidecar in the background (no window)
@@ -41,11 +41,11 @@ Commands:
 function Cmd-Start {
     $existing = Get-SidecarProcs
     if ($existing) {
-        Write-Host "● hermes-sidecar - already running (pid $($existing[0].ProcessId))"
+        Write-Host "* hs - already running (pid $($existing[0].ProcessId))"
         return
     }
     if (-not (Test-Path $Py)) {
-        Write-Host "× pythonw.exe not found at $Py" -ForegroundColor Red
+        Write-Host "x pythonw.exe not found at $Py" -ForegroundColor Red
         return
     }
     Start-Process -FilePath $Py `
@@ -55,22 +55,22 @@ function Cmd-Start {
     Start-Sleep -Milliseconds 800
     $procs = Get-SidecarProcs
     if ($procs) {
-        Write-Host "● hermes-sidecar - started (pid $($procs[0].ProcessId))"
+        Write-Host "* hs - started (pid $($procs[0].ProcessId))"
     } else {
-        Write-Host "× hermes-sidecar - failed to start; check logs (hermes-sidecar logs)" -ForegroundColor Red
+        Write-Host "x hs - failed to start; check logs (hs logs)" -ForegroundColor Red
     }
 }
 
 function Cmd-Stop {
     $procs = Get-SidecarProcs
     if (-not $procs) {
-        Write-Host "○ hermes-sidecar - not running"
+        Write-Host "- hs - not running"
         return
     }
     foreach ($p in $procs) {
         Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
     }
-    Write-Host "● hermes-sidecar - stopped ($($procs.Count) process(es))"
+    Write-Host "* hs - stopped ($($procs.Count) process(es))"
 }
 
 function Cmd-Restart {
@@ -82,7 +82,7 @@ function Cmd-Restart {
 function Cmd-Status {
     $procs = Get-SidecarProcs
     if (-not $procs) {
-        Write-Host "● hermes-sidecar - inactive (dead)"
+        Write-Host "* hs - inactive (dead)"
         $logFile = Get-LatestLogFile
         if ($logFile) { Write-Host "  Last log:  $($logFile.FullName)" }
         return
@@ -95,7 +95,7 @@ function Cmd-Status {
     $uptime  = if ($started) { (Get-Date) - $started } else { $null }
     $logFile = Get-LatestLogFile
 
-    Write-Host "● hermes-sidecar - active (running)"
+    Write-Host "* hs - active (running)"
     Write-Host "  Main PID:  $($main.ProcessId)"
     if ($started) { Write-Host ("  Started:   {0}" -f $started) }
     if ($uptime)  { Write-Host ("  Uptime:    {0:dd\.hh\:mm\:ss}" -f $uptime) }
