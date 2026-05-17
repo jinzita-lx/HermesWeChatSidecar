@@ -20,9 +20,95 @@ from .win32_utils import stable_hash
 log = logging.getLogger(__name__)
 
 
+# Re-popout drives the WeChat UI, so a chat whose sub-window cannot be
+# recovered must not be retried every poll cycle.
+_RESOLVE_COOLDOWN_S = 60.0
+
+
+def _hwnd_alive(hwnd: int) -> bool:
+    """Cheap liveness check for a stored window handle."""
+    if not hwnd:
+        return False
+    try:
+        import win32gui
+        return bool(win32gui.IsWindow(hwnd))
+    except Exception:
+        return True  # can't tell — let ControlFromHandle be the judge
+
+
+def _resolve_subwindow(name: str) -> int:
+    """Re-discover *name*'s popped-out sub-window, re-popping it out if the
+    window was closed. Returns a fresh hwnd, or 0 if recovery failed."""
+    try:
+        from . import popout, window_finder
+        pids = window_finder.find_weixin_pids()
+        if not pids:
+            log.warning("re-resolve(%s): no running Weixin.exe", name)
+            return 0
+        hwnd = window_finder.find_chat_subwindow(name, pids)
+        if hwnd:
+            return hwnd
+        # Sub-window is gone — re-pop it out. Needs the main 微信 window
+        # reachable (same precondition as startup); best-effort otherwise.
+        log.info("re-resolve(%s): sub-window missing, re-popping out", name)
+        popout.popout_chat(name, pids)
+        for _ in range(25):  # up to ~5s for the new window to appear
+            hwnd = window_finder.find_chat_subwindow(name, pids)
+            if hwnd:
+                return hwnd
+            time.sleep(0.2)
+        log.warning("re-resolve(%s): sub-window did not reappear after re-popout", name)
+        return 0
+    except Exception:
+        log.exception("re-resolve(%s) failed", name)
+        return 0
+
+
 def _get_root(chat_state: Dict[str, Dict[str, Any]], name: str):
+    """UIA root control of *name*'s sub-window.
+
+    The stored hwnd goes stale if the popped-out window is closed or WeChat
+    restarts. On a stale handle, re-discover the sub-window (re-popping it
+    out if needed), update chat_state, re-seed the message snapshot, and
+    retry. Recovery is rate-limited so an unrecoverable chat does not drive
+    the WeChat UI every poll cycle. Returns None when recovery is not
+    possible right now (caller treats it like a missing message list)."""
     import uiautomation as auto
-    return auto.ControlFromHandle(chat_state[name]["hwnd"])
+
+    state = chat_state[name]
+    hwnd = state.get("hwnd") or 0
+
+    if _hwnd_alive(hwnd):
+        try:
+            root = auto.ControlFromHandle(hwnd)
+            if root is not None:
+                return root
+        except Exception as exc:
+            log.warning("get_root(%s): hwnd %s unusable: %s", name, hex(hwnd), exc)
+
+    # Handle is stale — rebuild it, but at most once per cooldown.
+    if time.time() - state.get("last_resolve_ts", 0.0) < _RESOLVE_COOLDOWN_S:
+        return None
+    state["last_resolve_ts"] = time.time()
+
+    new_hwnd = _resolve_subwindow(name)
+    if not new_hwnd:
+        log.error("get_root(%s): could not re-resolve sub-window; retry in ~%.0fs",
+                  name, _RESOLVE_COOLDOWN_S)
+        return None
+
+    state["hwnd"] = new_hwnd
+    log.info("get_root(%s): re-resolved sub-window hwnd=%s", name, hex(new_hwnd))
+    try:
+        root = auto.ControlFromHandle(new_hwnd)
+    except Exception:
+        log.exception("get_root(%s): re-resolved hwnd still unusable", name)
+        return None
+    if root is not None:
+        # Re-seed the snapshot so the rebuilt window's existing rows are not
+        # all re-emitted as new messages on the next poll.
+        snapshot_existing(chat_state, name)
+    return root
 
 
 def _get_msg_list(chat_state: Dict[str, Dict[str, Any]], name: str):

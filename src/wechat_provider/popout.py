@@ -17,12 +17,70 @@ from typing import Any, List, Set
 
 from . import win32_utils
 from .uia_utils import find_by, find_by_aid
-from .window_finder import find_main_weixin_window, weixin_top_level_hwnds
+from .window_finder import (
+    find_main_weixin_window,
+    find_main_weixin_window_any_state,
+    weixin_top_level_hwnds,
+)
 
 log = logging.getLogger(__name__)
 
 
+def _unminimize_main_offscreen(weixin_pids: Set[int]):
+    """If the main 微信 window is minimized, show it off-screen (at -30000,
+    no focus steal) so UIA can drive its session list. Returns a restore
+    token for _restore_main(), or None if nothing was changed."""
+    import win32con
+    import win32gui
+
+    main_hwnd = find_main_weixin_window_any_state(weixin_pids)
+    if main_hwnd is None or not win32gui.IsIconic(main_hwnd):
+        return None
+    try:
+        orig = win32gui.GetWindowPlacement(main_hwnd)
+        onr = orig[4]  # rcNormalPosition
+        w = max(800, onr[2] - onr[0])
+        h = max(600, onr[3] - onr[1])
+        win32gui.SetWindowPlacement(main_hwnd, (
+            orig[0], win32con.SW_SHOWNOACTIVATE, orig[2], orig[3],
+            (-30000, -30000, -30000 + w, -30000 + h),
+        ))
+        log.info("popout: main 微信 was minimized — un-minimized off-screen")
+        time.sleep(0.4)
+        return (main_hwnd, orig)
+    except Exception:
+        log.debug("popout: could not un-minimize main window", exc_info=True)
+        return None
+
+
+def _restore_main(token) -> None:
+    """Restore the main 微信 window placement saved by _unminimize_main_offscreen."""
+    if token is None:
+        return
+    import win32gui
+    main_hwnd, orig = token
+    try:
+        win32gui.SetWindowPlacement(main_hwnd, orig)
+        log.info("popout: main 微信 restored to original placement (minimized)")
+    except Exception:
+        log.debug("popout: could not restore main window placement", exc_info=True)
+
+
 def popout_chat(chat_name: str, weixin_pids: Set[int]) -> None:
+    """Pop *chat_name* out into its own sub-window.
+
+    Self-sufficient: if the main 微信 window is minimized it is temporarily
+    un-minimized off-screen (invisible, no focus steal) and restored
+    afterwards — callers (startup *and* the poller's stale-handle recovery)
+    no longer need to arrange that themselves."""
+    token = _unminimize_main_offscreen(weixin_pids)
+    try:
+        _popout_chat_impl(chat_name, weixin_pids)
+    finally:
+        _restore_main(token)
+
+
+def _popout_chat_impl(chat_name: str, weixin_pids: Set[int]) -> None:
     """Use main-window UIA to right-click the chat in the session list and
     select '独立窗口显示' from the context menu, so we don't require the
     user to set this up by hand."""
